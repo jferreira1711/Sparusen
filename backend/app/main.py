@@ -1,17 +1,15 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import socketio
-from app.routers import auth, users, materials, progress, quiz, classes
 from app.services.socket_events import sio
+from app.routers import auth, users, materials, progress, quiz, classes, recommendations
 
-# ── CREAR LA APLICACIÓN FASTAPI ────────────────────────────────
 fastapi_app = FastAPI(
     title="Plataforma de Idiomas API",
     description="API REST para la plataforma educativa de lenguas extranjeras",
-    version="3.0.0"
+    version="4.0.0"
 )
 
-# ── CONFIGURAR CORS ────────────────────────────────────────────
 fastapi_app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -24,31 +22,21 @@ fastapi_app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── REGISTRAR ROUTERS ──────────────────────────────────────────
 fastapi_app.include_router(auth.router)
 fastapi_app.include_router(users.router)
 fastapi_app.include_router(materials.router)
 fastapi_app.include_router(progress.router)
 fastapi_app.include_router(quiz.router)
 fastapi_app.include_router(classes.router)
+fastapi_app.include_router(recommendations.router)
 
-# ── ENDPOINT RAÍZ ─────────────────────────────────────────────
 @fastapi_app.get("/", tags=["Sistema"])
 def root():
     return {
-        "status":    "ok",
-        "version":   "3.0.0",
-        "fase":      "Fase 3 — Clases y Quiz Real",
-        "endpoints": [
-            "/auth", "/users", "/levels", "/units",
-            "/materials", "/progress", "/quiz", "/classes"
-        ]
+        "status":  "ok",
+        "version": "4.0.0",
+        "fase":    "Fase 4 — Motor ML Recomendaciones"
     }
 
-# ── MONTAR SOCKET.IO SOBRE FASTAPI ─────────────────────────────
-# IMPORTANTE: el objeto final se llama "app" no "fastapi_app"
-# uvicorn necesita encontrar "app" en este archivo
-app = socketio.ASGIApp(
-    sio,
-    other_asgi_app=fastapi_app
-)
+app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
+
