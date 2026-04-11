@@ -46,3 +46,9 @@ export const createQuestion = (materialId, data) => api.post(`/quiz/${materialId
 
 // Export default siempre al final
 export default api
+
+// Recomendaciones ML
+export const getRecommendations = (topN=5) => api.get(`/recommendations?top_n=${topN}`)
+export const acceptRecommendation = (id) => api.post(`/recommendations/${id}/accept`)
+export const rejectRecommendation = (id) => api.post(`/recommendations/${id}/reject`)
+export const getRecommendationMetrics = () => api.get("/recommendations/metrics")

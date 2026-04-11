@@ -11,6 +11,7 @@ import Quiz from "./pages/Quiz"
 import Classes from "./pages/Classes"
 import Classroom from "./pages/Classroom"
 import TeacherQuizEditor from "./pages/TeacherQuizEditor"
+import Recommendations from "./pages/Recommendations"
 
 export default function App() {
   return (
@@ -40,6 +41,7 @@ export default function App() {
           <Route path="/quiz-editor/:materialId" element={
             <PrivateRoute><TeacherQuizEditor /></PrivateRoute>
           } />
+          <Route path="/recommendations" element={<PrivateRoute><Recommendations /></PrivateRoute>} />
 
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route path="*" element={<Navigate to="/login" replace />} />
