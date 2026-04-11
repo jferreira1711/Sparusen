@@ -1,3 +1,4 @@
+"""test_recommender"""
 import sys
 import os
 # Agregar la carpeta backend al path para poder importar app.*
