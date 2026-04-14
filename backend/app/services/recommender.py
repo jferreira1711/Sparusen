@@ -5,6 +5,39 @@ from sqlalchemy.orm import Session
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from typing import List, Dict
+from scipy.sparse.linalg import svds
+from scipy.sparse import csr_matrix
+# ================= CACHE EN MEMORIA CON TTL =================
+import time
+from functools import wraps
+
+# Cache en memoria: { cache_key: {"data": resultado, "timestamp": tiempo} }
+_cache: Dict[str, dict] = {}
+CACHE_TTL_SECONDS = 1800  # 30 minutos
+
+def _cache_key(user_id: str, top_n: int) -> str:
+    """Genera la clave única del cache para un usuario y cantidad."""
+    return f"rec:{user_id}:{top_n}"
+
+def _get_from_cache(key: str):
+    """Devuelve datos del cache si existen y no han expirado. Sino None."""
+    if key not in _cache:
+        return None
+    entry = _cache[key]
+    if time.time() - entry["timestamp"] > CACHE_TTL_SECONDS:
+        del _cache[key]  # Expirado — eliminar
+        return None
+    return entry["data"]
+
+def _set_cache(key: str, data: list):
+    """Guarda datos en el cache con la marca de tiempo actual."""
+    _cache[key] = {"data": data, "timestamp": time.time()}
+
+def invalidate_user_cache(user_id: str):
+    """Borra todas las entradas del cache de un usuario."""
+    keys_to_delete = [k for k in _cache if k.startswith(f"rec:{user_id}:")]
+    for k in keys_to_delete:
+        del _cache[k]
 
 def _get_material_features(db: Session) -> pd.DataFrame:
     """
@@ -191,50 +224,197 @@ def normalize_scores(scores: Dict[str, float]) -> Dict[str, float]:
     max_v = max(scores.values()) or 1
     return {k: v / max_v for k, v in scores.items()}
 
-def hybrid_recommendations(
-    user_id: str, db: Session, top_n: int = 5,
-    weight_cb: float = 0.7, weight_col: float = 0.3
+# ================= SVD RECOMMENDATIONS =================
+
+def svd_recommendations(
+    user_id: str, db: Session, top_n: int = 5, n_factors: int = 10
 ) -> List[Dict]:
     """
-    Combina recomendaciones content-based (70%) y collaborative (30%).
-    Fórmula: score_hibrido = (score_cb * weight_cb) + (score_col * weight_col)
-    """
-    # Obtener el doble de recomendaciones de cada motor para tener más candidatos
-    rec_cb = content_based_recommendations(user_id, db, top_n=top_n * 2)
-    rec_col = collaborative_recommendations(user_id, db, top_n=top_n * 2)
+    Recomendaciones usando SVD (Singular Value Decomposition).
+    Descompone la matriz usuario-material en n_factors factores latentes.
+    Detecta patrones ocultos que el filtrado colaborativo simple no ve.
 
-    # Normalizar scores para que estén en el mismo rango
+    Parámetros:
+        n_factors: número de factores latentes (entre 2 y min(usuarios, materiales)-1)
+    """
+    matrix = _build_user_item_matrix(db)
+    if matrix.empty or user_id not in matrix.index:
+        return []
+
+    n_users, n_items = matrix.shape
+    # SVD necesita al menos 2 usuarios y 2 items
+    if n_users < 2 or n_items < 2:
+        return collaborative_recommendations(user_id, db, top_n=top_n)
+
+    # Ajustar n_factors al máximo posible
+    max_factors = min(n_users, n_items) - 1
+    k = min(n_factors, max_factors)
+    if k < 1:
+        return collaborative_recommendations(user_id, db, top_n=top_n)
+
+    # Convertir a matriz dispersa para eficiencia
+    sparse_matrix = csr_matrix(matrix.values.astype(float))
+
+    # Aplicar SVD: U * sigma * Vt = matrix
+    # U = factores de usuario (n_usuarios x k)
+    # sigma = valores singulares (k,)
+    # Vt = factores de material (k x n_materiales)
+    U, sigma, Vt = svds(sparse_matrix, k=k)
+
+    # Reconstruir la matriz con los factores latentes
+    sigma_diag = np.diag(sigma)
+    predicted = np.dot(np.dot(U, sigma_diag), Vt)
+
+    # Obtener el índice del usuario actual
+    user_idx = list(matrix.index).index(user_id)
+
+    # Scores predichos para el usuario actual
+    user_scores = predicted[user_idx]
+
+    # Materiales que ya vio (para excluirlos)
+    ya_vistos_idx = [i for i, v in enumerate(matrix.loc[user_id].values) if v > 0]
+
+    # Asignar score -inf a los ya vistos para que no aparezcan
+    scores_filtrados = user_scores.copy()
+    for idx in ya_vistos_idx:
+        scores_filtrados[idx] = -np.inf
+
+    # Top N indices por score predicho
+    top_indices = np.argsort(scores_filtrados)[::-1][:top_n]
+    mat_columns = list(matrix.columns)
+
+    from app.models.content import Material
+    result = []
+    for idx in top_indices:
+        if scores_filtrados[idx] == -np.inf:
+            continue
+        mat_id = mat_columns[idx]
+        m = db.query(Material).filter(Material.id == mat_id).first()
+        if m:
+            result.append({
+                "material_id": mat_id,
+                "titulo": m.titulo,
+                "tipo": m.tipo.value,
+                "score": round(float(scores_filtrados[idx]), 4),
+                "motivo": "Patrón de aprendizaje avanzado detectado",
+                "algoritmo": "svd"
+            })
+    return result
+
+# ================= PESOS DINÁMICOS SEGÚN HISTORIAL =================
+
+def get_dynamic_weights(user_id: str, db: Session) -> dict:
+    """
+    Calcula los pesos del algoritmo híbrido según el historial del usuario.
+    Devuelve:
+        weight_cb: peso para content-based
+        weight_col: peso para colaborativo/SVD
+        use_svd: si se debe usar SVD (True) o colaborativo básico (False)
+        nivel: etiqueta del nivel de usuario
+        total: número de materiales completados
+    """
+    from app.models.progress import LearningLog
+    total_completados = db.query(LearningLog).filter(
+        LearningLog.user_id == user_id,
+        LearningLog.completado == True
+    ).count()
+
+    if total_completados <= 2:
+        return {
+            "weight_cb": 1.0, "weight_col": 0.0, "use_svd": False,
+            "nivel": "nuevo", "total": total_completados
+        }
+    elif total_completados <= 9:
+        return {
+            "weight_cb": 0.8, "weight_col": 0.2, "use_svd": False,
+            "nivel": "activo", "total": total_completados
+        }
+    elif total_completados <= 19:
+        return {
+            "weight_cb": 0.65, "weight_col": 0.35, "use_svd": True,
+            "nivel": "regular", "total": total_completados
+        }
+    else:
+        return {
+            "weight_cb": 0.5, "weight_col": 0.5, "use_svd": True,
+            "nivel": "experto", "total": total_completados
+        }
+    
+def hybrid_recommendations(
+    user_id: str, db: Session, top_n: int = 5,
+    weight_cb: float = None, weight_col: float = None
+) -> List[Dict]:
+    """
+    Híbrido mejorado con SVD y pesos dinámicos.
+    Si weight_cb y weight_col son None, se calculan automáticamente según el historial.
+    """
+    # === VERIFICAR CACHE ===
+    cache_key = _cache_key(user_id, top_n)
+    cached = _get_from_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    # Obtener pesos dinámicos si no se especifican manualmente
+    weights = get_dynamic_weights(user_id, db)
+    w_cb = weight_cb if weight_cb is not None else weights["weight_cb"]
+    w_col = weight_col if weight_col is not None else weights["weight_col"]
+    use_svd = weights["use_svd"]
+
+    # Content-based siempre (doble de candidatos para tener más mezcla)
+    rec_cb = content_based_recommendations(user_id, db, top_n=top_n * 2)
+
+    # Colaborativo: SVD si hay historial suficiente y peso > 0, si no, colaborativo básico
+    if use_svd and w_col > 0:
+        rec_col = svd_recommendations(user_id, db, top_n=top_n * 2)
+        if not rec_col:
+            rec_col = collaborative_recommendations(user_id, db, top_n=top_n * 2)
+    elif w_col > 0:
+        rec_col = collaborative_recommendations(user_id, db, top_n=top_n * 2)
+    else:
+        rec_col = []
+
     scores_cb = normalize_scores({r["material_id"]: r["score"] for r in rec_cb})
     scores_col = normalize_scores({r["material_id"]: r["score"] for r in rec_col})
 
-    # Unir todos los IDs candidatos
     todos_ids = set(scores_cb.keys()) | set(scores_col.keys())
+    if not todos_ids:
+        return []
 
-    # Calcular score híbrido
-    hybrid: Dict[str, float] = {
-        mid: (scores_cb.get(mid, 0) * weight_cb) + (scores_col.get(mid, 0) * weight_col)
+    hybrid = {
+        mid: (scores_cb.get(mid, 0) * w_cb) + (scores_col.get(mid, 0) * w_col)
         for mid in todos_ids
     }
 
     from app.models.content import Material
     result = []
+    algo_tag = "svd" if use_svd else "collaborative"
+
     for mat_id in sorted(hybrid, key=hybrid.get, reverse=True)[:top_n]:
         m = db.query(Material).filter(Material.id == mat_id).first()
         if not m:
             continue
         s_cb = scores_cb.get(mat_id, 0)
         s_col = scores_col.get(mat_id, 0)
-        # Determinar qué motor contribuyó más
-        algoritmo = "hybrid-cb" if s_cb >= s_col else "hybrid-col"
-        motivo = "Similar a tu historial" if s_cb >= s_col else "Estudiantes similares lo recomiendan"
+
+        if s_cb >= s_col:
+            motivo = "Similar a materiales que ya estudiaste"
+            algoritmo = "hybrid-cb"
+        else:
+            motivo = "Patrón avanzado detectado" if use_svd else "Estudiantes similares"
+            algoritmo = f"hybrid-{algo_tag}"
+
         result.append({
             "material_id": mat_id,
             "titulo": m.titulo,
             "tipo": m.tipo.value,
             "score": round(hybrid[mat_id], 4),
             "motivo": motivo,
-            "algoritmo": algoritmo
+            "algoritmo": algoritmo,
+            "nivel_usuario": weights["nivel"]
         })
+
+    # === GUARDAR EN CACHE antes del return ===
+    _set_cache(cache_key, result)
     return result
 
 # ================= MÉTRICAS PARA LA TESIS =================
@@ -259,3 +439,4 @@ def recall_at_k(recommended: List[str], relevant: List[str], k: int) -> float:
         return 0.0
     hits = sum(1 for r in recommended[:k] if r in relevant)
     return round(hits / len(relevant), 4)
+

@@ -7,6 +7,8 @@ from app.models.user import User
 from app.schemas.progress import ProgressCreate, ProgressOut, SkillScoreOut
 from app.core.dependencies import get_current_user, get_current_student
 import uuid
+from app.services.recommender import invalidate_user_cache
+
 
 router = APIRouter(prefix="/progress", tags=["Progreso"])
 
@@ -50,6 +52,7 @@ def register_progress(
         db.add(log)
         db.commit()
         db.refresh(log)
+        invalidate_user_cache(str(current_user.id))
         return log
 
 

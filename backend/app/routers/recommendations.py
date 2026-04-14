@@ -1,4 +1,5 @@
 # backend/app/routers/recommendations.py
+import time
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -10,6 +11,8 @@ from app.core.dependencies import get_current_student, get_current_user
 from app.models.user import User
 from app.services.recommender import hybrid_recommendations
 import uuid
+from app.services.recommender import precision_at_k, recall_at_k, get_dynamic_weights
+from app.models.progress import LearningLog
 
 router = APIRouter(prefix="/recommendations", tags=["Recomendaciones IA"])
 
@@ -114,4 +117,94 @@ def get_metrics(
         "aceptadas": aceptadas,
         "rechazadas": rechazadas,
         "tasa_aceptacion_pct": round(aceptadas / total * 100, 2) if total > 0 else 0
+    }
+
+
+@router.get("/evaluate")
+def evaluate_recommendations(
+    k: int = Query(5, le=10, description="Evaluar top-K recomendaciones"),
+    db: Session = Depends(get_db),
+    student: User = Depends(get_current_student)
+):
+    """
+    Calcula Precision@K y Recall@K para el usuario actual.
+    Compara las recomendaciones guardadas con los materiales que
+    efectivamente estudió el usuario después de recibirlas.
+    """
+    # 1. Obtener IDs de recomendaciones pasadas (ordenadas por fecha)
+    recs_pasadas = db.query(AiRecommendation).filter(
+        AiRecommendation.user_id == student.id
+    ).order_by(AiRecommendation.generada_en.desc()).limit(20).all()
+
+    if not recs_pasadas:
+        return {
+            "error": "No hay recomendaciones pasadas para evaluar",
+            "sugerencia": "Genera recomendaciones desde GET /recommendations primero"
+        }
+
+    # 2. IDs de materiales recomendados
+    recommended_ids = [str(r.material_id_rec) for r in recs_pasadas]
+
+    # 3. IDs de materiales que el usuario realmente completó después
+    logs_completados = db.query(LearningLog).filter(
+        LearningLog.user_id == student.id,
+        LearningLog.completado == True
+    ).all()
+    relevant_ids = [str(l.material_id) for l in logs_completados]
+
+    if not relevant_ids:
+        return {
+            "error": "El usuario no ha completado ningún material todavía",
+            "sugerencia": "Completa materiales del catálogo para poder evaluar"
+        }
+
+    # 4. Calcular métricas
+    p_at_k = precision_at_k(recommended_ids, relevant_ids, k=k)
+    r_at_k = recall_at_k(recommended_ids, relevant_ids, k=k)
+    f1 = round(2 * p_at_k * r_at_k / (p_at_k + r_at_k), 4) if (p_at_k + r_at_k) > 0 else 0
+
+    # 5. Info del nivel del usuario
+    weights = get_dynamic_weights(str(student.id), db)
+
+    # 6. Tasa de aceptación histórica (si se registra el campo aceptada)
+    total_recs = len(recs_pasadas)
+    aceptadas = sum(1 for r in recs_pasadas if getattr(r, 'aceptada', False) is True)
+
+    return {
+        "usuario": student.nombre,
+        "nivel_usuario": weights["nivel"],
+        "materiales_completados": weights["total"],
+        "algoritmo_activo": "svd-hibrido" if weights["use_svd"] else "content-based",
+        f"precision_at_{k}": p_at_k,
+        f"recall_at_{k}": r_at_k,
+        f"f1_at_{k}": f1,
+        "total_recomendaciones_evaluadas": total_recs,
+        "materiales_relevantes": len(relevant_ids),
+        "tasa_aceptacion_pct": round(aceptadas / total_recs * 100, 2) if total_recs > 0 else 0,
+        "interpretacion": {
+            "precision": f"{round(p_at_k*100,1)}% de las top-{k} recomendaciones fueron relevantes",
+            "recall": f"Se capturó el {round(r_at_k*100,1)}% de los materiales de interés del usuario"
+        }
+    }
+
+
+@router.get("/cache/status")
+def cache_status(_: User = Depends(get_current_student)):
+    """
+    Muestra el estado actual del cache de recomendaciones (solo para depuración).
+    """
+    from app.services.recommender import _cache, CACHE_TTL_SECONDS
+    now = time.time()
+    entradas = [
+        {
+            "key": k,
+            "edad_segundos": round(now - v["timestamp"]),
+            "expira_en": round(CACHE_TTL_SECONDS - (now - v["timestamp"]))
+        }
+        for k, v in _cache.items()
+    ]
+    return {
+        "total_entradas_en_cache": len(_cache),
+        "ttl_segundos": CACHE_TTL_SECONDS,
+        "entradas": entradas
     }
