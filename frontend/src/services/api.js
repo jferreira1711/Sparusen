@@ -52,3 +52,7 @@ export const getRecommendations = (topN=5) => api.get(`/recommendations?top_n=${
 export const acceptRecommendation = (id) => api.post(`/recommendations/${id}/accept`)
 export const rejectRecommendation = (id) => api.post(`/recommendations/${id}/reject`)
 export const getRecommendationMetrics = () => api.get("/recommendations/metrics")
+
+// === FASE 5 — Metricas avanzadas ===
+export const evaluateRecommendations = (k=5) => api.get(`/recommendations/evaluate?k=${k}`)
+export const getCacheStatus = () => api.get("/recommendations/cache/status")
